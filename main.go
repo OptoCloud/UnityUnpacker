@@ -10,145 +10,141 @@ import (
 	"strings"
 )
 
-// extractTarGz extracts a .tar.gz file into the specified destination directory.
-func extractTarGz(srcFile, destDir string) error {
-	// Open the .tar.gz file
+type UnityAsset struct {
+	AssetPath string
+	MetaPath  string
+	PathName  string
+}
+
+// extractTarGz reads .tar.gz and returns a list of UnityAssets (pathname, asset path, meta path).
+func extractTarGz(srcFile, tempDir string) ([]UnityAsset, error) {
+	fmt.Printf("[INFO] Extracting archive: %s\n", srcFile)
+
 	file, err := os.Open(srcFile)
 	if err != nil {
-		return fmt.Errorf("failed to open file: %w", err)
+		return nil, fmt.Errorf("failed to open file: %w", err)
 	}
 	defer file.Close()
 
-	// Create a gzip reader
 	gzipReader, err := gzip.NewReader(file)
 	if err != nil {
-		return fmt.Errorf("failed to create gzip reader: %w", err)
+		return nil, fmt.Errorf("failed to create gzip reader: %w", err)
 	}
 	defer gzipReader.Close()
 
-	// Create a tar reader
 	tarReader := tar.NewReader(gzipReader)
 
-	// Iterate over the tar archive entries
+	var current UnityAsset
+	var assets []UnityAsset
+
 	for {
 		header, err := tarReader.Next()
 		if err == io.EOF {
-			// End of archive
 			break
 		}
 		if err != nil {
-			return fmt.Errorf("failed to read tar archive: %w", err)
+			return nil, fmt.Errorf("failed to read tar archive: %w", err)
 		}
 
-		// Compute the path for the extracted file/directory
-		targetPath := filepath.Join(destDir, header.Name)
+		parts := strings.SplitN(header.Name, "/", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		dirName, fileName := parts[0], parts[1]
 
-		// Process based on the header type
-		switch header.Typeflag {
-		case tar.TypeDir:
-			break
-		case tar.TypeReg:
-			// Create the file
-			if err := os.MkdirAll(filepath.Dir(targetPath), os.FileMode(0755)); err != nil {
-				return fmt.Errorf("failed to create parent directory for file %s: %w", targetPath, err)
+		switch fileName {
+		case "asset", "asset.meta":
+			destPath := filepath.Join(tempDir, dirName, fileName)
+			if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+				return nil, fmt.Errorf("failed to create directory for %s: %w", destPath, err)
 			}
-			outFile, err := os.Create(targetPath)
+			outFile, err := os.Create(destPath)
 			if err != nil {
-				return fmt.Errorf("failed to create file %s: %w", targetPath, err)
+				return nil, fmt.Errorf("failed to create file %s: %w", destPath, err)
 			}
-
-			// Copy the file contents
 			if _, err := io.Copy(outFile, tarReader); err != nil {
 				outFile.Close()
-				return fmt.Errorf("failed to write file %s: %w", targetPath, err)
+				return nil, fmt.Errorf("failed to extract %s: %w", destPath, err)
 			}
 			outFile.Close()
-			break
-		default:
-			// Handle other file types as needed (e.g., symbolic links)
-			fmt.Printf("Skipping unsupported file type for %s\n", header.Name)
-			break
+			if fileName == "asset" {
+				current.AssetPath = destPath
+			} else {
+				current.MetaPath = destPath
+			}
+		case "pathname":
+			buf := new(strings.Builder)
+			if _, err := io.Copy(buf, tarReader); err != nil {
+				return nil, fmt.Errorf("failed to read pathname: %w", err)
+			}
+			current.PathName = buf.String()
+			assets = append(assets, current)
+			current = UnityAsset{} // reset
 		}
 	}
-
-	return nil
+	fmt.Printf("[INFO] Extracted %d Unity assets\n", len(assets))
+	return assets, nil
 }
 
-// reconstructStructure organizes the extracted files into the proper Unity asset structure, and outputs them to a specified target directory.
-func reconstructStructure(outputDir string, targetDir string) error {
-	entries, err := os.ReadDir(outputDir)
-	if err != nil {
-		return fmt.Errorf("failed to read output directory: %w", err)
+func moveFile(source, destination string) error {
+	destDir := filepath.Dir(destination)
+	if err := os.MkdirAll(destDir, 0755); err != nil {
+		return fmt.Errorf("failed to create directory %s: %w", destDir, err)
 	}
 
-	for _, entry := range entries {
-		if entry.IsDir() {
-			// Read the "pathname" file in each folder
-			metadataPath := filepath.Join(outputDir, entry.Name(), "pathname")
-			content, err := os.ReadFile(metadataPath)
-			if err != nil {
-				return fmt.Errorf("failed to read metadata file %s: %w", metadataPath, err)
-			}
-
-			// Construct the target path based on the new targetDir
-			newTargetPath := filepath.Join(targetDir, string(content))
-			newTargetDir := filepath.Dir(newTargetPath)
-
-			// Ensure the target directory exists
-			if err := os.MkdirAll(newTargetDir, os.FileMode(0755)); err != nil {
-				return fmt.Errorf("failed to create target directory %s: %w", newTargetDir, err)
-			}
-
-			// Check if the "asset" file exists
-			sourcePath := filepath.Join(outputDir, entry.Name(), "asset")
-			if _, err := os.Stat(sourcePath); err == nil {
-				// Copy the asset file to the new target directory
-				if err := copyFile(sourcePath, newTargetPath); err != nil {
-					return fmt.Errorf("failed to copy asset file %s to %s: %w", sourcePath, newTargetPath, err)
-				}
-
-				// Remove the original asset file
-				if err := os.Remove(sourcePath); err != nil {
-					return fmt.Errorf("failed to delete original asset file %s: %w", sourcePath, err)
-				}
-			} else if !os.IsNotExist(err) {
-				// Return error if it’s not a "file does not exist" error
-				return fmt.Errorf("failed to check existence of asset file %s: %w", sourcePath, err)
-			}
-		}
+	// Try fast rename first
+	err := os.Rename(source, destination)
+	if err == nil {
+		return nil
 	}
 
-	return nil
-}
-
-// copyFile copies a file from source to destination.
-func copyFile(source, destination string) error {
-	// Open the source file
-	sourceFile, err := os.Open(source)
+	// Fallback to copy + delete
+	in, err := os.Open(source)
 	if err != nil {
 		return fmt.Errorf("failed to open source file %s: %w", source, err)
 	}
-	defer sourceFile.Close()
+	defer in.Close()
 
-	// Create the destination file
-	destFile, err := os.Create(destination)
+	out, err := os.Create(destination)
 	if err != nil {
 		return fmt.Errorf("failed to create destination file %s: %w", destination, err)
 	}
-	defer destFile.Close()
+	defer out.Close()
 
-	// Copy the contents from source to destination
-	_, err = io.Copy(destFile, sourceFile)
-	if err != nil {
-		return fmt.Errorf("failed to copy file from %s to %s: %w", source, destination, err)
+	if _, err := io.Copy(out, in); err != nil {
+		return fmt.Errorf("failed to copy data from %s to %s: %w", source, destination, err)
 	}
 
-	// Ensure the destination file is written to disk
-	err = destFile.Sync()
-	if err != nil {
-		return fmt.Errorf("failed to sync destination file %s: %w", destination, err)
-	}
+	return nil
+}
 
+// reconstructStructure moves asset/meta files to their target locations.
+func reconstructStructure(assets []UnityAsset, targetDir string) error {
+	fmt.Printf("[INFO] Reconstructing Unity structure in: %s\n", targetDir)
+
+	for _, asset := range assets {
+		if asset.PathName == "" || asset.AssetPath == "" {
+			fmt.Printf("[WARN] Skipping incomplete entry (missing pathname or asset)\n")
+			continue
+		}
+
+		targetAsset := filepath.Join(targetDir, asset.PathName)
+		targetMeta := targetAsset + ".meta"
+
+		fmt.Printf("[INFO] Moving asset: %s\n", asset.PathName)
+
+		if err := moveFile(asset.AssetPath, targetAsset); err != nil {
+			return fmt.Errorf("failed to move asset: %w", err)
+		}
+		if asset.MetaPath != "" {
+			if err := moveFile(asset.MetaPath, targetMeta); err != nil {
+				return fmt.Errorf("failed to move meta: %w", err)
+			}
+		} else {
+			fmt.Printf("[INFO] No .meta file found for %s\n", asset.PathName)
+		}
+	}
+	fmt.Printf("[INFO] Reconstruction complete.\n")
 	return nil
 }
 
@@ -162,42 +158,49 @@ func main() {
 	var outputDir string
 
 	if len(os.Args) < 3 {
-		// Derive output folder name from the input file name
 		baseName := filepath.Base(inputFile)
 		outputDir = strings.TrimSuffix(baseName, filepath.Ext(baseName))
 	} else {
 		outputDir = os.Args[2]
 	}
 
-	// Ensure the output directory exists
-	if err := os.MkdirAll(outputDir, os.FileMode(0755)); err != nil {
-		fmt.Printf("Failed to create output directory: %v\n", err)
+	fmt.Printf("[INFO] Input File: %s\n", inputFile)
+	fmt.Printf("[INFO] Output Directory: %s\n", outputDir)
+
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		fmt.Printf("[ERROR] Failed to create output directory: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Use a temporary directory for intermediate files
-	tempDir, err := os.MkdirTemp("", "unpack-unitypackage-*")
+	// Create temp dir on same drive as output
+	tempParent := filepath.Join(outputDir, ".tmp_unpack")
+	if err := os.MkdirAll(tempParent, os.ModePerm); err != nil {
+		fmt.Printf("[ERROR] Failed to create temp directory root: %v\n", err)
+		os.Exit(1)
+	}
+	tempDir, err := os.MkdirTemp(tempParent, "unpack-unitypackage-*")
 	if err != nil {
-		fmt.Printf("Failed to create temporary directory: %v\n", err)
+		fmt.Printf("[ERROR] Failed to create temp directory: %v\n", err)
 		os.Exit(1)
 	}
 	defer func() {
-		if err := os.RemoveAll(tempDir); err != nil {
-			fmt.Printf("Warning: Failed to delete temporary directory: %v\n", err)
+		if err := os.RemoveAll(tempParent); err != nil {
+			fmt.Printf("[WARN] Failed to delete temp directory: %v\n", err)
 		}
 	}()
 
-	// Step 1: Extract the .tar.gz archive into the temporary directory
-	if err := extractTarGz(inputFile, tempDir); err != nil {
-		fmt.Printf("Failed to extract archive: %v\n", err)
+	// Step 1: Extract
+	assets, err := extractTarGz(inputFile, tempDir)
+	if err != nil {
+		fmt.Printf("[ERROR] Extraction failed: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Step 2: Reconstruct the Unity file structure into the output directory
-	if err := reconstructStructure(tempDir, outputDir); err != nil {
-		fmt.Printf("Failed to reconstruct Unity file structure: %v\n", err)
+	// Step 2: Reconstruct
+	if err := reconstructStructure(assets, outputDir); err != nil {
+		fmt.Printf("[ERROR] Reconstruction failed: %v\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Printf("Successfully unpacked %s into %s\n", inputFile, outputDir)
+	fmt.Printf("[SUCCESS] Unpacked %s into %s\n", inputFile, outputDir)
 }
