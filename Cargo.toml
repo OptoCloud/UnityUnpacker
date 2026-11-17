@@ -1,0 +1,36 @@
+[package]
+name = "unity-unpacker"
+version = "0.2.0"
+edition = "2024"
+description = "Extract .unitypackage files, from the command line or a native GUI"
+license = "GPL-3.0-only"
+default-run = "unity-unpacker"
+
+[features]
+default = ["gui"]
+# Builds the wxWidgets GUI. Disable with --no-default-features for a CLI-only build
+# that needs no C++ toolchain.
+gui = ["dep:wxdragon"]
+
+[[bin]]
+name = "unity-unpacker"
+path = "src/main.rs"
+
+[[bin]]
+name = "unity-unpacker-gui"
+path = "src/bin/unity-unpacker-gui.rs"
+required-features = ["gui"]
+
+[dependencies]
+tar = "0.4.46"
+flate2 = "1.1.11"
+tempfile = "3.27.0"
+wxdragon = { version = "0.9.25", optional = true, default-features = false }
+
+[build-dependencies]
+embed-manifest = "1.5.1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
