@@ -63,6 +63,8 @@ pub struct Settings {
     /// With `preload_previews`: keep images as copies of at most this many pixels on
     /// the longer side instead of the original files. 0 keeps the originals.
     pub preview_max_px: u64,
+    /// GUI: use dark colours. Takes effect the next time the app starts.
+    pub dark_mode: bool,
 }
 
 impl Default for Settings {
@@ -74,6 +76,7 @@ impl Default for Settings {
             memory_reserve_percent: LoadPolicy::DEFAULT_RESERVE_PERCENT as u64,
             preload_previews: false,
             preview_max_px: 0,
+            dark_mode: false,
         }
     }
 }
@@ -163,6 +166,7 @@ mod tests {
             memory_reserve_percent: 25,
             preload_previews: true,
             preview_max_px: 512,
+            dark_mode: true,
         };
         settings.save_to(&path).unwrap();
         assert_eq!(Settings::load_from(&path), Some(settings));

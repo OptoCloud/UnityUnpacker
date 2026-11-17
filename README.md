@@ -48,6 +48,8 @@ Selecting a file in the GUI shows it in the panel on the right:
 - **Audio** (WAV, OGG, MP3, FLAC, AIFF) gets Play and Stop buttons.
 - **Text** (scripts, shaders, JSON, YAML assets and anything else that turns out to be text) shows its first 256 KB. **Open copy in editor** saves a copy to the system temp folder and opens it in the program registered for its type; the copies are deleted when the app closes. Files whose extension is not a known text or code type get `.txt` added to the copy's name, so a package cannot have something run by being "previewed".
 
+While no file is selected, the panel shows the package's own picture if it has one. Asset Store packages carry it as `.icon.png` at the top level of the archive, and you can add one to your own packages the same way. It is always loaded, whatever the mode, and is not extracted.
+
 A file that is loaded previews instantly. One that is not (everything in two pass mode) has to be found by reading through the package again, every time. To avoid that in two pass mode, turn on **Also load images and sounds into memory** in the settings. With a pixel limit set, images are kept as reduced copies instead of the original files, which uses less memory but makes opening the package slower, since every image is decoded.
 
 ## Settings
@@ -64,7 +66,8 @@ The GUI shows the settings the first time it starts; change them later with the 
   "small_file_mb": 8,
   "memory_reserve_percent": 10,
   "preload_previews": false,
-  "preview_max_px": 0
+  "preview_max_px": 0,
+  "dark_mode": false
 }
 ```
 
@@ -76,6 +79,7 @@ The GUI shows the settings the first time it starts; change them later with the 
 | `memory_reserve_percent` | Share of the PC's memory that loading leaves free before it pauses and asks. |
 | `preload_previews` | Two pass, GUI only: also keep images and sounds in memory for instant previews. |
 | `preview_max_px` | With `preload_previews`: keep images as copies of at most this many pixels on the longer side. `0` keeps the original files. |
+| `dark_mode` | GUI only: use dark colours. Takes effect the next time the app starts. |
 
 ## Building
 

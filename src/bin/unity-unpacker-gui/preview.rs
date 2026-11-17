@@ -28,7 +28,7 @@ const TEXT_LIMIT: u64 = 256 * 1024;
 const MEDIA_LIMIT: u64 = 256 * 1024 * 1024;
 /// Decoded images are kept at most this many pixels wide or tall; the pane scales
 /// that copy to fit, so resizing the window doesn't decode again.
-const IMAGE_MAX: u32 = 1024;
+pub const IMAGE_MAX: u32 = 1024;
 const MARGIN: i32 = 8;
 
 /// Text files larger than this are not copied out for an external editor.
@@ -219,6 +219,8 @@ struct State {
     cancel: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
     rx: Option<Receiver<Reply>>,
+    /// The open package's name and its own picture, shown while no file is selected.
+    package: Option<(String, Option<Arc<Thumb>>)>,
     /// The file being shown, for opening it in an external editor.
     current: Option<(String, Source)>,
     /// Problems from background jobs, to show in the pane.
@@ -359,9 +361,26 @@ impl Preview {
         self.halt();
         let w = self.w;
         let Some(request) = request else {
-            w.title.set_label("Preview");
-            w.info.set_label("");
-            self.present(None, "Select a file to preview it.");
+            let package = self.state.borrow().package.clone();
+            match package {
+                Some((name, Some(icon))) => {
+                    w.title.set_label(&name);
+                    w.info.set_label("Package icon");
+                    self.state.borrow_mut().picture = Some(icon.picture.clone());
+                    self.present(Some(&w.canvas), "Select a file to preview it.");
+                    self.fit_image();
+                }
+                Some((name, None)) => {
+                    w.title.set_label(&name);
+                    w.info.set_label("");
+                    self.present(None, "Select a file to preview it.");
+                }
+                None => {
+                    w.title.set_label("Preview");
+                    w.info.set_label("");
+                    self.present(None, "Open a package, then select a file to preview it.");
+                }
+            }
             return;
         };
 
@@ -399,6 +418,13 @@ impl Preview {
                 content,
             });
         }));
+    }
+
+    /// Says which package is open (or that none is) and shows its picture, if it has
+    /// one, in place of a file preview.
+    pub fn set_package(&self, package: Option<(String, Option<Arc<Thumb>>)>) {
+        self.state.borrow_mut().package = package;
+        self.show(None);
     }
 
     /// Stops reading and playing, and waits for the worker so it no longer has any

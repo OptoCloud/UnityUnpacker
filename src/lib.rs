@@ -7,6 +7,7 @@
 //! <guid>/asset.meta   Unity's .meta sidecar
 //! <guid>/pathname     the project-relative destination, e.g. "Assets/Foo/Bar.png"
 //! <guid>/preview.png  optional thumbnail (ignored)
+//! .icon.png           optional picture of the whole package (Asset Store packages)
 //! ```
 //!
 //! Tar order usually puts `pathname` *after* `asset`, so the destination of an asset is
@@ -148,11 +149,16 @@ enum Member<'a> {
     Asset(&'a str),
     Meta(&'a str),
     PathName(&'a str),
+    /// The package's own picture, `.icon.png` at the top level.
+    PackageIcon,
     Other,
 }
 
 fn classify(name: &str) -> Member<'_> {
     let name = name.strip_prefix("./").unwrap_or(name);
+    if name == ".icon.png" {
+        return Member::PackageIcon;
+    }
     let Some((guid, file)) = name.split_once('/') else {
         return Member::Other;
     };
@@ -463,6 +469,8 @@ pub trait LoadEvents {
 /// For callers with nothing to report to.
 impl LoadEvents for () {}
 
+/// A package icon larger than this is ignored; real ones are a few hundred kilobytes.
+const PACKAGE_ICON_MAX: u64 = 16 << 20;
 /// Available memory is re-checked after this many bytes have been read into memory.
 const MEMORY_CHECK_INTERVAL: u64 = 16 << 20;
 
@@ -534,6 +542,8 @@ pub struct Loaded {
     pub entries: Vec<Entry>,
     /// Raw pathnames that were refused because they would escape the output folder.
     pub rejected: Vec<String>,
+    /// The package's `.icon.png`, if it has one. Always loaded, whatever the policy.
+    pub package_icon: Option<Arc<Vec<u8>>>,
     payloads: HashMap<String, Payloads>,
     temp: TempStore,
     memory_bytes: u64,
@@ -601,6 +611,7 @@ fn load_with(
     let ctx = || format!("failed to read {}", package.display());
 
     let mut index = Index::default();
+    let mut package_icon = None;
     let mut payloads: HashMap<String, Payloads> = HashMap::new();
     let mut temp = TempStore::new(temp_parent);
     let mut memory_bytes = 0u64;
@@ -620,6 +631,14 @@ fn load_with(
                 member.read_to_string(&mut raw).ctx(ctx)?;
                 index.pathname(guid, &raw);
                 events.progress(fraction());
+                continue;
+            }
+            Member::PackageIcon => {
+                if member.size() <= PACKAGE_ICON_MAX {
+                    let mut data = Vec::new();
+                    member.read_to_end(&mut data).ctx(ctx)?;
+                    package_icon = Some(Arc::new(data));
+                }
                 continue;
             }
             Member::Other => continue,
@@ -723,6 +742,7 @@ fn load_with(
         package: package.to_owned(),
         entries,
         rejected,
+        package_icon,
         payloads,
         temp,
         memory_bytes,
@@ -1062,6 +1082,7 @@ mod tests {
             Compression::fast(),
         ));
         // Tar order mimics Unity exports: asset, asset.meta, pathname.
+        add(&mut b, ".icon.png", b"ICON");
         add(&mut b, "aaaa/asset.meta", b"folder meta"); // folder: meta only
         add(&mut b, "aaaa/pathname", b"Assets/Textures");
         add(&mut b, "bbbb/asset", b"PNGDATA");
@@ -1185,6 +1206,11 @@ mod tests {
             assert!(loaded.entries[1].is_folder());
             assert_eq!(loaded.entries[2].size, 7);
             assert_eq!(loaded.rejected, ["../../evil.txt"]);
+            // The package icon is loaded whatever the policy, and is not an entry.
+            assert_eq!(
+                loaded.package_icon.as_deref().map(Vec::as_slice),
+                Some(&b"ICON"[..])
+            );
 
             let stats = loaded.extract(None, &out, &mut |_| {}, &never()).unwrap();
             assert_eq!(stats, EXPECTED, "{policy:?}");

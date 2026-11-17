@@ -19,6 +19,7 @@ use unity_unpacker::settings::{Mode, Settings};
 use unity_unpacker::{
     Entry, LoadEvents, Loaded, LowMemory, Media, OnLowMemory, Progress, Stats, format_size, load,
 };
+use wxdragon::appearance::{AppAppearance, Appearance};
 use wxdragon::prelude::*;
 use wxdragon::timer::Timer;
 use wxdragon::widgets::button::ButtonBitmapPosition;
@@ -106,8 +107,14 @@ struct Ui {
 fn main() {
     let initial = std::env::args_os().nth(1).map(PathBuf::from);
     let _ = wxdragon::main(move |_| {
-        let (ui, tree, preview, icons) = build_ui();
         let saved = Settings::load();
+        // Has to be decided before the first window exists.
+        if saved.is_some_and(|s| s.dark_mode)
+            && let Some(app) = wxdragon::app::get_app()
+        {
+            app.set_appearance(Appearance::Dark);
+        }
+        let (ui, tree, preview, icons) = build_ui();
         let state = Rc::new(RefCell::new(State {
             loaded: None,
             entries: Vec::new(),
@@ -435,7 +442,7 @@ fn start_load(ui: Ui, state: &Rc<RefCell<State>>, package: PathBuf) {
     ui.package_text.set_value(&package.to_string_lossy());
     let out_dir = default_output(&package);
     ui.output_text.set_value(&out_dir.to_string_lossy());
-    st.preview.show(None);
+    st.preview.set_package(None);
     st.loaded = None; // deletes the previous package's temp folder
     st.entries.clear();
     st.thumbs.clear();
@@ -746,6 +753,13 @@ fn finish_load(ui: Ui, state: &Rc<RefCell<State>>, result: Result<(Loaded, Thumb
                 )
             });
             let rejected = std::mem::take(&mut loaded.rejected);
+            let name = loaded.package().file_name().unwrap_or_default();
+            let icon = loaded.package_icon.as_ref().and_then(|bytes| {
+                let thumb = Thumb::decode(bytes, preview::IMAGE_MAX).ok()?;
+                Some(Arc::new(thumb))
+            });
+            st.preview
+                .set_package(Some((name.to_string_lossy().into_owned(), icon)));
             st.loaded = Some(loaded);
             refresh_controls(ui, &st);
             drop(st);
@@ -967,6 +981,12 @@ fn settings_dialog(ui: Ui, icons: &Icons, current: Settings, first_run: bool) ->
         radios.push((mode, radio));
     }
 
+    let dark_mode = CheckBox::builder(&dialog)
+        .with_label("Dark mode (applies the next time the app starts)")
+        .build();
+    dark_mode.set_value(current.dark_mode);
+    root.add(&dark_mode, 0, sides | SizerFlag::Top, MARGIN);
+
     let note = wrapped(&match Settings::path() {
         Some(path) => format!(
             "Changes apply to the next package you open.\nSaved to {}",
@@ -1042,6 +1062,7 @@ fn settings_dialog(ui: Ui, icons: &Icons, current: Settings, first_run: bool) ->
         memory_reserve_percent: reserve.value().clamp(0, 100) as u64,
         preload_previews: preload.get_value(),
         preview_max_px: thumb_px.value().max(0) as u64,
+        dark_mode: dark_mode.get_value(),
     };
     dialog.destroy();
     accepted.then_some(settings)
