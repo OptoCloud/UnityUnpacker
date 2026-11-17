@@ -10,7 +10,7 @@ default-run = "unity-unpacker"
 default = ["gui"]
 # Builds the wxWidgets GUI. Disable with --no-default-features for a CLI-only build
 # that needs no C++ toolchain.
-gui = ["dep:wxdragon"]
+gui = ["dep:wxdragon", "dep:image", "dep:rodio"]
 
 [[bin]]
 name = "unity-unpacker"
@@ -18,17 +18,22 @@ path = "src/main.rs"
 
 [[bin]]
 name = "unity-unpacker-gui"
-path = "src/bin/unity-unpacker-gui.rs"
+path = "src/bin/unity-unpacker-gui/main.rs"
 required-features = ["gui"]
 
 [dependencies]
 tar = "0.4.46"
 flate2 = "1.1.11"
 tempfile = "3.27.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0"
 wxdragon = { version = "0.9.25", optional = true, default-features = false }
+image = { version = "0.25.10", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tga", "tiff"], optional = true }
+rodio = { version = "0.23.0", default-features = false, features = ["playback", "flac", "mp3", "vorbis", "wav", "symphonia-aiff"], optional = true }
 
 [build-dependencies]
 embed-manifest = "1.5.1"
+embed-resource = "3.0.12"
 
 [profile.release]
 lto = true

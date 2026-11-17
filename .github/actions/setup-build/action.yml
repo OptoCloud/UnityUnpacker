@@ -23,7 +23,8 @@ runs:
         sudo apt-get update
         sudo apt-get install -y --no-install-recommends \
           ninja-build cmake libclang-dev pkg-config libgtk-3-dev libpng-dev libjpeg-dev \
-          libgl1-mesa-dev libglu1-mesa-dev libxkbcommon-dev libexpat1-dev libtiff-dev
+          libgl1-mesa-dev libglu1-mesa-dev libxkbcommon-dev libexpat1-dev libtiff-dev \
+          libasound2-dev
 
     - name: Install Ninja (Windows)
       if: runner.os == 'Windows'
