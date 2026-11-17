@@ -124,14 +124,14 @@ fn produce(request: &Request, cancel: &AtomicBool) -> Result<Content, Error> {
     }
     Ok(match kind {
         Kind::Image => {
-            let bytes = request.source.read(MEDIA_LIMIT, cancel)?;
+            let bytes = request.source.bytes(MEDIA_LIMIT, cancel)?;
             match Thumb::decode(&bytes, IMAGE_MAX) {
                 Ok(thumb) => Content::Image(thumb),
                 Err(e) => Content::Nothing(format!("Could not decode this image: {e}")),
             }
         }
         Kind::Audio => {
-            let bytes = Bytes(Arc::new(request.source.read(MEDIA_LIMIT, cancel)?));
+            let bytes = Bytes(request.source.bytes(MEDIA_LIMIT, cancel)?);
             match rodio::Decoder::try_from(Cursor::new(bytes.clone())) {
                 Ok(decoder) => Content::Audio {
                     duration: decoder.total_duration(),
@@ -465,7 +465,8 @@ impl Preview {
             st.notices.as_ref().and_then(|(_, rx)| rx.try_recv().ok())
         };
         if let Some(notice) = notice {
-            self.present(Some(&self.w.text), &notice);
+            // Whatever is being shown by now stays; only the message is added.
+            self.set_message(&notice);
         }
         let reply = {
             let st = self.state.borrow();
@@ -512,6 +513,12 @@ impl Preview {
         // Only text is worth handing to an editor.
         w.open
             .show(content.is_some_and(|c| c.handle_ptr() == w.text.handle_ptr()));
+        self.set_message(message);
+    }
+
+    /// Puts `message` above the content (or removes it, if empty) and lays out again.
+    fn set_message(&self, message: &str) {
+        let w = self.w;
         w.message.set_label(message);
         w.message.show(!message.is_empty());
         w.panel.layout();

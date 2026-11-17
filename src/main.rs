@@ -1,13 +1,13 @@
 //! Command-line front end.
 
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 
 use unity_unpacker::settings::{Mode, Settings};
 use unity_unpacker::{
-    Error, LoadEvents, LowMemory, OnLowMemory, Progress, Stats, format_size, load,
+    Error, LoadEvents, LowMemory, OnLowMemory, Progress, Stats, default_output_name, format_size,
+    load,
 };
 
 const USAGE: &str = "\
@@ -178,10 +178,10 @@ impl LoadEvents for Events {
 /// (as the original tool did), next to the package when started from Explorer, where
 /// the working directory is not somewhere the user chose.
 fn default_output(input: &Path, standalone: bool) -> PathBuf {
-    let stem: OsString = input.file_stem().unwrap_or(input.as_os_str()).to_owned();
+    let name = default_output_name(input);
     match input.parent() {
-        Some(parent) if standalone => parent.join(stem),
-        _ => PathBuf::from(stem),
+        Some(parent) if standalone => parent.join(name),
+        _ => PathBuf::from(name),
     }
 }
 

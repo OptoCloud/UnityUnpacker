@@ -16,7 +16,9 @@ Two binaries:
 
   On Windows you can also drag one or more packages onto `unity-unpacker.exe`. Each is extracted into a folder named after it, next to the package, and the console window stays open until you press Enter.
 
-Paths inside a package that would escape the output folder (`../`, absolute, or drive paths) are skipped.
+Paths inside a package that would escape the output folder (`../`, absolute, or drive paths) are skipped. If extraction is cancelled or fails, the files written so far are kept, but the one being written at that moment is removed rather than left incomplete.
+
+The Windows builds need the Microsoft Visual C++ Redistributable (x64), which most PCs already have. If Windows reports a missing `VCRUNTIME140.dll` or `MSVCP140.dll`, install it from <https://aka.ms/vs/17/release/vc_redist.x64.exe>.
 
 ## Extraction modes
 
@@ -30,7 +32,7 @@ A package is a compressed archive that lists each file's name *after* its conten
 
 Extracting writes what is ticked: loaded files are written or moved into place, and anything that is not loaded is read from the package. Whatever was loaded but not ticked is then discarded, and the temp folder is removed. That also happens on cancel, when another package is opened, and on exit. In the GUI the temp folder sits next to the package, so moving files into the default output folder is a cheap rename; on the command line it goes inside the output folder.
 
-**Running low on memory.** Before a file is read into memory, the tool checks that doing so would still leave 10% of the PC's memory free. If not, the GUI pauses loading and asks:
+**Running low on memory.** Before a file is read into memory, the tool checks that doing so would still leave 10% of the PC's memory free. If not, single pass carries on in its temp folder, and two pass with preloaded previews leaves the rest in the package. In-memory mode has no such fallback of its own, so there the GUI pauses loading and asks:
 
 - **Use temp folder**: what is in memory is written to the temp folder and the rest of the package is loaded there too.
 - **Switch to two pass**: what is in memory stays, the rest is left in the package and read from it when you extract.
@@ -76,7 +78,7 @@ The GUI shows the settings the first time it starts; change them later with the 
 | `mode` | `two-pass`, `single-pass` or `in-memory`. |
 | `memory_limit_mb` | Single pass: most memory the loaded files may use in total. |
 | `small_file_mb` | Single pass: files larger than this go straight to the temp folder. |
-| `memory_reserve_percent` | Share of the PC's memory that loading leaves free before it pauses and asks. |
+| `memory_reserve_percent` | Share of the PC's memory that loading leaves free. In-memory mode pauses and asks rather than cut into it; the other modes stop loading into memory. |
 | `preload_previews` | Two pass, GUI only: also keep images and sounds in memory for instant previews. |
 | `preview_max_px` | With `preload_previews`: keep images as copies of at most this many pixels on the longer side. `0` keeps the original files. |
 | `dark_mode` | GUI only: use dark colours. Takes effect the next time the app starts. |

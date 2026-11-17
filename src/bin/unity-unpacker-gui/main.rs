@@ -17,7 +17,8 @@ use std::thread::JoinHandle;
 
 use unity_unpacker::settings::{Mode, Settings};
 use unity_unpacker::{
-    Entry, LoadEvents, Loaded, LowMemory, Media, OnLowMemory, Progress, Stats, format_size, load,
+    Entry, LoadEvents, Loaded, LowMemory, Media, OnLowMemory, Progress, Stats, default_output_name,
+    format_size, load,
 };
 use wxdragon::appearance::{AppAppearance, Appearance};
 use wxdragon::prelude::*;
@@ -50,10 +51,10 @@ enum Msg {
         low: LowMemory,
         reply: Sender<OnLowMemory>,
     },
-    Loaded(Result<(Loaded, Thumbs), String>),
+    Loaded(Result<(Loaded, Thumbs), unity_unpacker::Error>),
     Extracted {
         out_dir: PathBuf,
-        result: Result<Stats, String>,
+        result: Result<Stats, unity_unpacker::Error>,
         /// Handed back so the package can be previewed and extracted again.
         loaded: Loaded,
     },
@@ -142,7 +143,9 @@ fn main() {
         refresh_controls(ui, &state.borrow());
 
         // First run: let the user pick how packages are read before anything is loaded.
-        if saved.is_none() {
+        // A settings file that is there but can't be read is not a first run: it is
+        // left alone (and the defaults used) rather than overwritten.
+        if saved.is_none() && !Settings::path().is_some_and(|path| path.exists()) {
             edit_settings(ui, &state, true);
         }
         if let Some(path) = initial {
@@ -169,7 +172,10 @@ fn build_ui() -> (Ui, Rc<Tree>, Rc<Preview>, Rc<Icons>) {
     };
 
     let label = |text: &str| StaticText::builder(&panel).with_label(text).build();
-    let package_text = TextCtrl::builder(&panel).build();
+    // Without this style wxWidgets never reports Enter being pressed.
+    let package_text = TextCtrl::builder(&panel)
+        .with_style(TextCtrlStyle::ProcessEnter)
+        .build();
     let package_browse = with_icon(
         Button::builder(&panel).with_label("Browse...").build(),
         Icon::PrefabModel,
@@ -315,6 +321,16 @@ fn wire_events(ui: Ui, state: &Rc<RefCell<State>>) {
         }
     });
 
+    // "Open output folder" follows what is in the box. This also fires when the box is
+    // filled in while a load is being set up and `state` is borrowed; the controls are
+    // refreshed right after that anyway.
+    let s = state.clone();
+    ui.output_text.on_text_changed(move |_| {
+        if let Ok(st) = s.try_borrow() {
+            update_open_folder(ui, &st);
+        }
+    });
+
     // Enter in the package box loads whatever path was typed or pasted.
     let s = state.clone();
     ui.package_text.on_text_enter(move |_| {
@@ -346,7 +362,11 @@ fn wire_events(ui: Ui, state: &Rc<RefCell<State>>) {
     // Selecting a file previews it.
     let s = state.clone();
     tree.on_select(move |entry| {
-        let st = s.borrow();
+        // GTK can report the selection going away while the tree is being refilled,
+        // which happens with `state` borrowed; there is nothing to preview then.
+        let Ok(st) = s.try_borrow() else {
+            return;
+        };
         let request = match (entry.and_then(|i| st.entries.get(i)), &st.loaded) {
             (Some(entry), Some(loaded)) => Some(preview::Request {
                 name: entry.path.rsplit('/').next().unwrap_or_default().to_owned(),
@@ -363,7 +383,7 @@ fn wire_events(ui: Ui, state: &Rc<RefCell<State>>) {
     ui.settings.on_click(move |_| edit_settings(ui, &s, false));
 
     ui.open_folder
-        .on_click(move |_| open_in_file_manager(Path::new(&ui.output_text.get_value())));
+        .on_click(move |_| open_in_file_manager(Path::new(ui.output_text.get_value().trim())));
 
     let s = state.clone();
     ui.extract.on_click(move |_| {
@@ -467,9 +487,14 @@ fn start_load(ui: Ui, state: &Rc<RefCell<State>>, package: PathBuf) {
         let mut events = WorkerEvents {
             report: progress_reporter(tx.clone()),
             tx: tx.clone(),
-            // Two pass only holds previews in memory; when those don't fit, the rest
-            // simply stays in the package. Nothing to ask.
-            ask: settings.mode != Mode::TwoPass,
+            // Only in-memory mode has a real choice to offer. Two pass only holds
+            // previews in memory, and when those don't fit the rest simply stays in
+            // the package; single pass has its temp folder for exactly this.
+            unprompted: match settings.mode {
+                Mode::TwoPass => Some(OnLowMemory::StopLoading),
+                Mode::SinglePass => Some(OnLowMemory::UseTemp),
+                Mode::InMemory => None,
+            },
             thumb_px: u32::try_from(settings.preview_max_px).unwrap_or(u32::MAX),
             thumbs: Thumbs::new(),
         };
@@ -477,9 +502,7 @@ fn start_load(ui: Ui, state: &Rc<RefCell<State>>, package: PathBuf) {
         // so moving them into place later is a rename, not a copy.
         let temp_parent = out_dir.parent().unwrap_or(Path::new("."));
         let result = load(&package, temp_parent, policy, &mut events, &cancel);
-        let result = result
-            .map(|loaded| (loaded, events.thumbs))
-            .map_err(|e| e.to_string());
+        let result = result.map(|loaded| (loaded, events.thumbs));
         let _ = tx.send(Msg::Loaded(result));
     }));
 }
@@ -488,7 +511,8 @@ fn start_load(ui: Ui, state: &Rc<RefCell<State>>, package: PathBuf) {
 struct WorkerEvents<R> {
     report: R,
     tx: Sender<Msg>,
-    ask: bool,
+    /// What to do when memory runs low, or `None` to ask the user.
+    unprompted: Option<OnLowMemory>,
     /// Longest side of the copies kept of images, or 0 to keep the files themselves.
     thumb_px: u32,
     thumbs: Thumbs,
@@ -502,8 +526,8 @@ impl<R: FnMut(Progress)> LoadEvents for WorkerEvents<R> {
     /// Hands the question to the UI thread and waits for the answer. If the window
     /// goes away in the meantime, so does the reply channel.
     fn low_memory(&mut self, low: LowMemory) -> OnLowMemory {
-        if !self.ask {
-            return OnLowMemory::StopLoading;
+        if let Some(answer) = self.unprompted {
+            return answer;
         }
         let (reply, answer) = mpsc::channel();
         let _ = self.tx.send(Msg::LowMemory { low, reply });
@@ -564,9 +588,7 @@ fn start_extract(ui: Ui, state: &Rc<RefCell<State>>) {
 
     st.worker = Some(std::thread::spawn(move || {
         let mut report = progress_reporter(tx.clone());
-        let result = loaded
-            .extract(Some(&selected), &out_dir, &mut report, &cancel)
-            .map_err(|e| e.to_string());
+        let result = loaded.extract(Some(&selected), &out_dir, &mut report, &cancel);
         let _ = tx.send(Msg::Extracted {
             out_dir,
             result,
@@ -721,7 +743,11 @@ fn low_memory_dialog(ui: Ui, low: LowMemory) -> OnLowMemory {
     answer
 }
 
-fn finish_load(ui: Ui, state: &Rc<RefCell<State>>, result: Result<(Loaded, Thumbs), String>) {
+fn finish_load(
+    ui: Ui,
+    state: &Rc<RefCell<State>>,
+    result: Result<(Loaded, Thumbs), unity_unpacker::Error>,
+) {
     let mut st = state.borrow_mut();
     st.busy = Busy::Idle;
     st.rx = None;
@@ -765,12 +791,8 @@ fn finish_load(ui: Ui, state: &Rc<RefCell<State>>, result: Result<(Loaded, Thumb
             drop(st);
             warn_rejected(ui, &rejected);
         }
-        Err(_) if st.cancel.load(Ordering::Relaxed) => {
-            ui.status.set_label("Cancelled.");
-            refresh_controls(ui, &st);
-        }
-        Err(e) if e == unity_unpacker::Error::Cancelled.to_string() => {
-            // Cancelled from the low-memory prompt rather than the Cancel button.
+        // From the Cancel button or from the low-memory prompt.
+        Err(unity_unpacker::Error::Cancelled) => {
             ui.status.set_label("Cancelled.");
             refresh_controls(ui, &st);
         }
@@ -787,7 +809,7 @@ fn finish_extract(
     ui: Ui,
     state: &Rc<RefCell<State>>,
     out_dir: PathBuf,
-    result: Result<Stats, String>,
+    result: Result<Stats, unity_unpacker::Error>,
     loaded: Loaded,
 ) {
     let mut st = state.borrow_mut();
@@ -806,7 +828,7 @@ fn finish_extract(
             ));
             None
         }
-        Err(_) if st.cancel.load(Ordering::Relaxed) => {
+        Err(unity_unpacker::Error::Cancelled) => {
             ui.gauge.set_value(0);
             ui.status
                 .set_label("Cancelled. Files already written were kept.");
@@ -1108,16 +1130,21 @@ fn refresh_controls(ui: Ui, st: &State) {
     ui.extract
         .set_label(if idle { "Extract" } else { "Cancel" });
     ui.extract.enable(!idle || loaded);
-    ui.open_folder
-        .enable(idle && Path::new(&ui.output_text.get_value()).is_dir());
+    update_open_folder(ui, st);
     update_summary(ui, st);
     ui.frame.layout();
 }
 
+/// "Open output folder" works when nothing is running and the folder exists.
+fn update_open_folder(ui: Ui, st: &State) {
+    let exists = Path::new(ui.output_text.get_value().trim()).is_dir();
+    ui.open_folder.enable(st.busy == Busy::Idle && exists);
+}
+
 /// Sibling folder named after the package, e.g. `Downloads/Foo.unitypackage` -> `Downloads/Foo`.
 fn default_output(package: &Path) -> PathBuf {
-    let stem = package.file_stem().unwrap_or(package.as_os_str());
-    package.parent().unwrap_or(Path::new(".")).join(stem)
+    let parent = package.parent().unwrap_or(Path::new("."));
+    parent.join(default_output_name(package))
 }
 
 fn open_in_file_manager(dir: &Path) {
@@ -1139,7 +1166,8 @@ fn open_path(path: &Path) -> std::io::Result<()> {
         .map(drop)
 }
 
-/// Warns about package entries whose paths would have escaped the output folder.
+/// Warns about package entries whose paths would have escaped the output folder, or
+/// could not be read as paths.
 fn warn_rejected(ui: Ui, rejected: &[String]) {
     if rejected.is_empty() {
         return;
@@ -1147,7 +1175,7 @@ fn warn_rejected(ui: Ui, rejected: &[String]) {
     let shown: Vec<_> = rejected.iter().take(10).map(String::as_str).collect();
     let more = rejected.len() - shown.len();
     let mut msg = format!(
-        "{} entries were skipped because their paths would land outside the output folder:\n\n{}",
+        "{} entries were skipped because their paths are not safe to extract to:\n\n{}",
         rejected.len(),
         shown.join("\n")
     );

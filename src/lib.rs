@@ -248,6 +248,19 @@ fn copy(
     }
 }
 
+/// Reads past the rest of a member nobody wants. Left alone, `tar` does this itself on
+/// the way to the next member, where a multi-gigabyte asset could not be cancelled.
+fn skip(
+    src: &mut dyn Read,
+    cancel: &AtomicBool,
+    tick: &mut dyn FnMut(),
+) -> io::Result<Option<u64>> {
+    copy(src, &mut io::sink(), cancel, tick)
+}
+
+/// A `pathname` member longer than this is refused; real ones are a line of text.
+const PATHNAME_MAX: u64 = 64 << 10;
+
 /// Accumulates the package index while members stream past in any order.
 #[derive(Default)]
 struct Index {
@@ -274,12 +287,15 @@ impl Index {
         self.by_guid.entry(guid.to_owned()).or_default().has_meta = true;
     }
 
-    fn pathname(&mut self, guid: &str, raw: &str) {
-        match sanitize_pathname(raw) {
+    /// Records where a GUID goes, or refuses it if the path is unsafe or not UTF-8.
+    fn pathname(&mut self, guid: &str, raw: &[u8]) {
+        match std::str::from_utf8(raw).ok().and_then(sanitize_pathname) {
             Some(path) => self.by_guid.entry(guid.to_owned()).or_default().path = Some(path),
-            None => self
-                .rejected
-                .push(raw.lines().next().unwrap_or_default().to_owned()),
+            None => {
+                let shown = String::from_utf8_lossy(raw);
+                self.rejected
+                    .push(shown.lines().next().unwrap_or_default().to_owned());
+            }
         }
     }
 
@@ -540,7 +556,8 @@ pub struct Loaded {
     package: PathBuf,
     /// Entries sorted by path.
     pub entries: Vec<Entry>,
-    /// Raw pathnames that were refused because they would escape the output folder.
+    /// Raw pathnames that were refused: they would escape the output folder, or are
+    /// not readable as a path at all (not UTF-8, or absurdly long).
     pub rejected: Vec<String>,
     /// The package's `.icon.png`, if it has one. Always loaded, whatever the policy.
     pub package_icon: Option<Arc<Vec<u8>>>,
@@ -627,21 +644,35 @@ fn load_with(
             Member::Asset(g) => (g, false),
             Member::Meta(g) => (g, true),
             Member::PathName(guid) => {
-                let mut raw = String::new();
-                member.read_to_string(&mut raw).ctx(ctx)?;
-                index.pathname(guid, &raw);
+                // The size comes from an untrusted header: never read more than a
+                // path could possibly need.
+                if member.size() <= PATHNAME_MAX {
+                    let mut raw = Vec::new();
+                    member.read_to_end(&mut raw).ctx(ctx)?;
+                    index.pathname(guid, &raw);
+                } else {
+                    index
+                        .rejected
+                        .push(format!("(the path of {guid} is too long to be one)"));
+                    skip(&mut member, cancel, &mut || events.progress(fraction()))
+                        .ctx(ctx)?
+                        .ok_or(Error::Cancelled)?;
+                }
                 events.progress(fraction());
                 continue;
             }
-            Member::PackageIcon => {
-                if member.size() <= PACKAGE_ICON_MAX {
-                    let mut data = Vec::new();
-                    member.read_to_end(&mut data).ctx(ctx)?;
-                    package_icon = Some(Arc::new(data));
-                }
+            Member::PackageIcon if member.size() <= PACKAGE_ICON_MAX => {
+                let mut data = Vec::new();
+                member.read_to_end(&mut data).ctx(ctx)?;
+                package_icon = Some(Arc::new(data));
                 continue;
             }
-            Member::Other => continue,
+            Member::PackageIcon | Member::Other => {
+                skip(&mut member, cancel, &mut || events.progress(fraction()))
+                    .ctx(ctx)?
+                    .ok_or(Error::Cancelled)?;
+                continue;
+            }
         };
 
         let size = member.size();
@@ -720,6 +751,9 @@ fn load_with(
             temp.bytes += n;
             (Some(Payload::Temp(path)), n)
         } else {
+            skip(&mut reader, cancel, &mut tick)
+                .ctx(ctx)?
+                .ok_or(Error::Cancelled)?;
             (None, size)
         };
 
@@ -815,7 +849,7 @@ impl Source {
                     if cancel.load(Ordering::Relaxed) {
                         return Err(Error::Cancelled);
                     }
-                    let member = member.ctx(ctx)?;
+                    let mut member = member.ctx(ctx)?;
                     let name = String::from_utf8_lossy(&member.path_bytes()).into_owned();
                     if matches!(classify(&name), Member::Asset(g) if g == guid) {
                         copy(&mut member.take(limit), &mut out, cancel, &mut || {})
@@ -824,6 +858,9 @@ impl Source {
                         found = true;
                         break;
                     }
+                    skip(&mut member, cancel, &mut || {})
+                        .ctx(ctx)?
+                        .ok_or(Error::Cancelled)?;
                 }
                 if !found {
                     return Err(io::Error::from(io::ErrorKind::NotFound))
@@ -832,6 +869,15 @@ impl Source {
             }
         }
         Ok(out)
+    }
+
+    /// Like [`Source::read`], but an asset that is already in memory and within
+    /// `limit` is shared rather than copied.
+    pub fn bytes(&self, limit: u64, cancel: &AtomicBool) -> Result<Arc<Vec<u8>>, Error> {
+        match self {
+            Source::Memory(data) if data.len() as u64 <= limit => Ok(data.clone()),
+            _ => self.read(limit, cancel).map(Arc::new),
+        }
     }
 }
 
@@ -881,9 +927,12 @@ impl Loaded {
     /// Loaded payloads are written or moved into place; the rest are read from the
     /// package in one more pass. Afterwards nothing is loaded any more: the payloads
     /// that were not selected are discarded and the temp directory is removed, on
-    /// success, error and cancellation alike. Files already put in place before an
-    /// error or cancellation are kept. The file list stays, so the same `Loaded` can be
-    /// extracted again; that then reads everything from the package.
+    /// success, error and cancellation alike. (The one exception: if `out_dir` cannot
+    /// be created, nothing is touched and everything stays loaded.) Files already put
+    /// in place before an error or cancellation are kept; the one being written at
+    /// that moment is removed rather than left cut short. The file list stays, so the
+    /// same `Loaded` can be extracted again; that then reads everything from the
+    /// package.
     pub fn extract(
         &mut self,
         selected: Option<&HashSet<String>>,
@@ -891,13 +940,15 @@ impl Loaded {
         progress: &mut dyn FnMut(Progress),
         cancel: &AtomicBool,
     ) -> Result<Stats, Error> {
+        // First, so a mistyped output folder doesn't cost what is loaded.
+        fs::create_dir_all(out_dir).ctx(|| format!("failed to create {}", out_dir.display()))?;
+
         // Taking these out is what discards them when this returns, however it does.
         let mut payloads = std::mem::take(&mut self.payloads);
         let fresh = TempStore::new(&self.temp.parent);
         let temp = std::mem::replace(&mut self.temp, fresh);
         self.memory_bytes = 0;
 
-        fs::create_dir_all(out_dir).ctx(|| format!("failed to create {}", out_dir.display()))?;
         let wanted: Vec<(&Entry, Payloads)> = self
             .entries
             .iter()
@@ -957,8 +1008,12 @@ impl Loaded {
             }
         }
 
-        // Step 2: stream whatever was not loaded straight out of the package.
-        if !pending.is_empty() {
+        // Step 2: stream whatever was not loaded straight out of the package, stopping
+        // as soon as the last of it has been found.
+        let mut remaining: usize = (pending.values())
+            .map(|job| usize::from(job.need_asset) + usize::from(job.need_meta))
+            .sum();
+        if remaining > 0 {
             let mut archive = Archive::open(&self.package)?;
             let fraction = archive.fraction();
             let tick = |progress: &mut dyn FnMut(Progress)| {
@@ -972,28 +1027,34 @@ impl Loaded {
                 }
                 let mut member = member.ctx(ctx)?;
                 let name = String::from_utf8_lossy(&member.path_bytes()).into_owned();
-                let (guid, is_meta) = match classify(&name) {
-                    Member::Asset(g) => (g, false),
-                    Member::Meta(g) => (g, true),
-                    _ => continue,
+                let wanted = match classify(&name) {
+                    Member::Asset(guid) => Some((guid, false)),
+                    Member::Meta(guid) => Some((guid, true)),
+                    _ => None,
                 };
-                let Some(job) = pending.get(guid) else {
+                // Each half is claimed once, so a member that appears twice in the
+                // package is not counted (or written) twice.
+                let claimed = wanted.and_then(|(guid, is_meta)| {
+                    let job = pending.get_mut(guid)?;
+                    let need = if is_meta {
+                        &mut job.need_meta
+                    } else {
+                        &mut job.need_asset
+                    };
+                    std::mem::take(need).then_some((job.entry, is_meta))
+                });
+                let Some((entry, is_meta)) = claimed else {
+                    skip(&mut member, cancel, &mut || tick(progress))
+                        .ctx(ctx)?
+                        .ok_or(Error::Cancelled)?;
                     continue;
                 };
-                let needed = if is_meta {
-                    job.need_meta
-                } else {
-                    job.need_asset
-                };
-                if !needed {
-                    continue;
-                }
 
-                let mut dest = out_dir.join(&job.entry.path);
+                let mut dest = out_dir.join(&entry.path);
                 if is_meta {
                     dest.as_mut_os_string().push(".meta");
                 } else {
-                    progress(Progress::Writing(&job.entry.path));
+                    progress(Progress::Writing(&entry.path));
                 }
                 if let Some(parent) = dest.parent() {
                     fs::create_dir_all(parent)
@@ -1001,7 +1062,13 @@ impl Loaded {
                 }
                 let mut out =
                     File::create(&dest).ctx(|| format!("failed to create {}", dest.display()))?;
-                let n = copy(&mut member, &mut out, cancel, &mut || tick(progress))
+                let copied = copy(&mut member, &mut out, cancel, &mut || tick(progress));
+                drop(out);
+                // A file cut short would look like the real thing; don't leave one.
+                if !matches!(copied, Ok(Some(_))) {
+                    let _ = fs::remove_file(&dest);
+                }
+                let n = copied
                     .ctx(|| format!("failed to write {}", dest.display()))?
                     .ok_or(Error::Cancelled)?;
                 if is_meta {
@@ -1009,6 +1076,10 @@ impl Loaded {
                 } else {
                     stats.files += 1;
                     stats.bytes += n;
+                }
+                remaining -= 1;
+                if remaining == 0 {
+                    break;
                 }
             }
         }
@@ -1021,15 +1092,16 @@ impl Loaded {
     }
 }
 
-/// Puts a loaded payload at `dest`, replacing an existing file.
+/// Puts a loaded payload at `dest`, replacing an existing file. If that fails part-way
+/// (a full disk, say), the incomplete file is removed.
 fn place(payload: Payload, dest: &Path) -> Result<(), Error> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).ctx(|| format!("failed to create {}", parent.display()))?;
     }
     match payload {
-        Payload::Memory(data) => {
-            fs::write(dest, &*data).ctx(|| format!("failed to write {}", dest.display()))
-        }
+        Payload::Memory(data) => fs::write(dest, &*data)
+            .inspect_err(|_| drop(fs::remove_file(dest)))
+            .ctx(|| format!("failed to write {}", dest.display())),
         Payload::Temp(src) => move_file(&src, dest),
     }
 }
@@ -1041,9 +1113,24 @@ fn move_file(src: &Path, dest: &Path) -> Result<(), Error> {
         return Ok(());
     }
     fs::copy(src, dest)
+        .inspect_err(|_| drop(fs::remove_file(dest)))
         .ctx(|| format!("failed to move {} to {}", src.display(), dest.display()))?;
     let _ = fs::remove_file(src);
     Ok(())
+}
+
+/// Name of the folder a package is extracted into by default: the package's name
+/// without its extension. A package that has no extension gets a suffix instead, so
+/// the folder never has the name of the package itself.
+pub fn default_output_name(package: &Path) -> std::ffi::OsString {
+    let mut name = package
+        .file_stem()
+        .unwrap_or(package.as_os_str())
+        .to_owned();
+    if package.extension().is_none() {
+        name.push("_unpacked");
+    }
+    name
 }
 
 /// Human-readable byte count.
@@ -1554,12 +1641,126 @@ mod tests {
                 b"using UnityEngine;"
             );
             assert_eq!(source.read(5, &never()).unwrap(), b"using");
+            assert_eq!(
+                *source.bytes(u64::MAX, &never()).unwrap(),
+                b"using UnityEngine;"
+            );
+            assert_eq!(*source.bytes(5, &never()).unwrap(), b"using");
         }
         let gone = Source::Package {
             package: pkg,
             guid: "zzzz".to_owned(),
         };
         assert!(matches!(gone.read(10, &never()), Err(Error::Io { .. })));
+    }
+
+    #[test]
+    fn default_output_names() {
+        let name = |p: &str| default_output_name(Path::new(p));
+        assert_eq!(name("Downloads/Foo.unitypackage"), "Foo");
+        assert_eq!(name("Foo.v2.unitypackage"), "Foo.v2");
+        assert_eq!(name("Downloads/Foo"), "Foo_unpacked");
+    }
+
+    #[test]
+    fn unreadable_pathnames_are_rejected_not_fatal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg = tmp.path().join("odd.unitypackage");
+        let mut b = tar::Builder::new(GzEncoder::new(
+            File::create(&pkg).unwrap(),
+            Compression::fast(),
+        ));
+        add(&mut b, "aaaa/asset", b"fine");
+        add(&mut b, "aaaa/pathname", b"Assets/fine.txt");
+        add(&mut b, "bbbb/asset", b"latin");
+        add(&mut b, "bbbb/pathname", b"Assets/caf\xE9.txt");
+        add(&mut b, "cccc/asset", b"long");
+        add(
+            &mut b,
+            "cccc/pathname",
+            &vec![b'a'; PATHNAME_MAX as usize + 1],
+        );
+        b.into_inner().unwrap().finish().unwrap();
+
+        for policy in POLICIES {
+            let loaded = load_plain(&pkg, tmp.path(), policy);
+            let paths: Vec<_> = loaded.entries.iter().map(|e| e.path.as_str()).collect();
+            assert_eq!(paths, ["Assets/fine.txt"]);
+            assert_eq!(loaded.rejected.len(), 2, "{:?}", loaded.rejected);
+            assert!(loaded.rejected[0].starts_with("Assets/caf"));
+        }
+    }
+
+    /// A package where the wanted file comes first and a damaged member follows: the
+    /// second pass must stop once it has what it needs, and so never reach the damage.
+    #[test]
+    fn second_pass_stops_when_everything_is_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg = tmp.path().join("big.unitypackage");
+        let mut b = tar::Builder::new(GzEncoder::new(
+            File::create(&pkg).unwrap(),
+            Compression::none(),
+        ));
+        add(&mut b, "aaaa/asset", b"wanted");
+        add(&mut b, "aaaa/pathname", b"a.txt");
+        add(&mut b, "bbbb/asset", &vec![7u8; 1 << 20]);
+        add(&mut b, "bbbb/pathname", b"b.bin");
+        b.into_inner().unwrap().finish().unwrap();
+
+        let mut loaded = load_plain(&pkg, tmp.path(), LoadPolicy::TWO_PASS);
+        // Cut the package off in the middle of the second asset.
+        let len = fs::metadata(&pkg).unwrap().len();
+        let file = fs::OpenOptions::new().write(true).open(&pkg).unwrap();
+        file.set_len(len / 2).unwrap();
+        drop(file);
+
+        let out = tmp.path().join("out");
+        let only: HashSet<String> = ["aaaa".to_owned()].into();
+        let stats = loaded
+            .extract(Some(&only), &out, &mut |_| {}, &never())
+            .unwrap();
+        assert_eq!(stats.files, 1);
+        assert_eq!(fs::read(out.join("a.txt")).unwrap(), b"wanted");
+        // Asking for the damaged one fails, and leaves no cut-short file behind.
+        let other: HashSet<String> = ["bbbb".to_owned()].into();
+        let result = loaded.extract(Some(&other), &out, &mut |_| {}, &never());
+        assert!(matches!(result, Err(Error::Io { .. })));
+        assert!(!out.join("b.bin").exists());
+    }
+
+    #[test]
+    fn cancelling_mid_file_leaves_no_partial_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg = make_package(tmp.path());
+        let out = tmp.path().join("out");
+        let mut loaded = load_plain(&pkg, tmp.path(), LoadPolicy::TWO_PASS);
+        let cancel = never();
+        // Cancel as the first file is announced, before any of it is written.
+        let mut progress = |p: Progress| {
+            if matches!(p, Progress::Writing(_)) {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        };
+        let result = loaded.extract(None, &out, &mut progress, &cancel);
+        assert!(matches!(result, Err(Error::Cancelled)));
+        assert!(!out.join("Assets/Textures/a.png").exists());
+        // What was finished before that stays.
+        assert!(out.join("Assets/Textures.meta").exists());
+    }
+
+    #[test]
+    fn a_bad_output_folder_keeps_what_is_loaded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg = make_package(tmp.path());
+        let mut loaded = load_plain(&pkg, tmp.path(), LoadPolicy::IN_MEMORY);
+        // A file is in the way of the output folder.
+        let result = loaded.extract(None, &pkg.join("out"), &mut |_| {}, &never());
+        assert!(matches!(result, Err(Error::Io { .. })));
+        assert_eq!(loaded.memory_bytes(), 48);
+        assert!(matches!(loaded.source("cccc"), Source::Memory(_)));
+        let out = tmp.path().join("out");
+        let stats = loaded.extract(None, &out, &mut |_| {}, &never()).unwrap();
+        assert_eq!(stats, EXPECTED);
     }
 
     #[test]
