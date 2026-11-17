@@ -4,7 +4,7 @@ Extracts `.unitypackage` files into a regular folder tree (assets plus their `.m
 
 Two binaries:
 
-- **`unity-unpacker-gui`**: native desktop app (wxWidgets: Win32 controls on Windows, GTK on Linux). Open or drag-and-drop a package, browse its contents as a tree, tick what you want, and extract. You can pass a package path as the first argument, so it also works as an "Open with" handler.
+- **`unity-unpacker-gui`**: native desktop app (wxWidgets: Win32 controls on Windows, GTK on Linux). Open or drag-and-drop a package, browse its contents as a tree, tick what you want, and extract. Tick **Single pass** to skip the preview and extract the whole package in one go (same as the CLI's `--single-pass`, below). You can pass a package path as the first argument, so it also works as an "Open with" handler.
 - **`unity-unpacker`**: command line.
 
   ```

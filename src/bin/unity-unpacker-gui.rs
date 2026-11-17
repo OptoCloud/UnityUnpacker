@@ -13,7 +13,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 
-use unity_unpacker::{Entry, Progress, ScanResult, Stats, extract, format_size, scan};
+use unity_unpacker::{
+    Entry, Progress, ScanResult, Stats, extract, extract_single_pass, format_size, scan,
+};
 use wxdragon::prelude::*;
 use wxdragon::timer::Timer;
 use wxdragon::widgets::treelistctrl::{
@@ -36,6 +38,9 @@ enum Msg {
     Extracted {
         out_dir: PathBuf,
         result: Result<Stats, String>,
+        /// Unsafe pathnames found while extracting. Only single pass fills this; the
+        /// normal flow reports them after the scan.
+        rejected: Vec<String>,
     },
 }
 
@@ -70,6 +75,7 @@ struct Ui {
     summary: StaticText,
     gauge: Gauge,
     status: StaticText,
+    single_pass: CheckBox,
     open_folder: Button,
     extract: Button,
 }
@@ -151,12 +157,18 @@ fn build_ui() -> Ui {
     let status = StaticText::builder(&panel)
         .with_label("Open or drop a .unitypackage to begin.")
         .build();
+    let single_pass = CheckBox::builder(&panel).with_label("Single pass").build();
+    single_pass.set_tooltip(
+        "Skip the preview and extract everything in one decompression pass.\n\
+         Files are staged in a temp folder inside the output folder, then moved into place.",
+    );
     let open_folder = Button::builder(&panel)
         .with_label("Open output folder")
         .build();
     let extract = Button::builder(&panel).with_label("Extract").build();
     let action_row = BoxSizer::builder(Orientation::Horizontal).build();
     action_row.add(&status, 1, center | SizerFlag::Right, 12);
+    action_row.add(&single_pass, 0, center | SizerFlag::Right, 12);
     action_row.add(&open_folder, 0, SizerFlag::Right, 6);
     action_row.add(&extract, 0, SizerFlag::empty(), 0);
 
@@ -196,6 +208,7 @@ fn build_ui() -> Ui {
         summary,
         gauge,
         status,
+        single_pass,
         open_folder,
         extract,
     }
@@ -260,6 +273,21 @@ fn wire_events(ui: Ui, state: &Rc<RefCell<State>>) {
         }
     });
 
+    // Turning single pass off needs the file list, so scan the package then.
+    let s = state.clone();
+    ui.single_pass.on_toggled(move |_| {
+        let (package, unscanned) = {
+            let st = s.borrow();
+            (st.package.clone(), st.entries.is_empty())
+        };
+        match package {
+            Some(package) if unscanned && !ui.single_pass.is_checked() => {
+                start_scan(ui, &s, package)
+            }
+            _ => refresh_controls(ui, &s.borrow()),
+        }
+    });
+
     ui.open_folder
         .on_click(move |_| open_in_file_manager(Path::new(&ui.output_text.get_value())));
 
@@ -317,8 +345,18 @@ fn start_scan(ui: Ui, state: &Rc<RefCell<State>>, package: PathBuf) {
     st.entries.clear();
     st.item_entry.clear();
     st.package = None;
-    ui.status.set_label("Reading package...");
     ui.gauge.set_value(0);
+
+    // Single pass extracts everything, so there is nothing to preview.
+    if ui.single_pass.is_checked() {
+        st.package = Some(package);
+        ui.status
+            .set_label("Ready. Extract unpacks the whole package in a single pass.");
+        refresh_controls(ui, &st);
+        return;
+    }
+
+    ui.status.set_label("Reading package...");
 
     let (tx, rx) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -346,8 +384,13 @@ fn start_extract(ui: Ui, state: &Rc<RefCell<State>>) {
         return;
     }
     let out_dir = PathBuf::from(out_text.trim());
-    let selected = selected_guids(ui, &st);
-    if selected.is_empty() {
+    let single_pass = ui.single_pass.is_checked();
+    let selected = if single_pass {
+        HashSet::new()
+    } else {
+        selected_guids(ui, &st)
+    };
+    if !single_pass && selected.is_empty() {
         error_box(ui, "Nothing is selected.");
         return;
     }
@@ -365,16 +408,28 @@ fn start_extract(ui: Ui, state: &Rc<RefCell<State>>) {
 
     std::thread::spawn(move || {
         let mut report = progress_reporter(tx.clone());
-        let result = extract(
-            &package,
-            &entries,
-            Some(&selected),
-            &out_dir,
-            &mut report,
-            &cancel,
-        )
-        .map_err(|e| e.to_string());
-        let _ = tx.send(Msg::Extracted { out_dir, result });
+        let (result, rejected) = if single_pass {
+            match extract_single_pass(&package, &out_dir, &mut report, &cancel) {
+                Ok(r) => (Ok(r.stats), r.rejected),
+                Err(e) => (Err(e.to_string()), Vec::new()),
+            }
+        } else {
+            let result = extract(
+                &package,
+                &entries,
+                Some(&selected),
+                &out_dir,
+                &mut report,
+                &cancel,
+            )
+            .map_err(|e| e.to_string());
+            (result, Vec::new())
+        };
+        let _ = tx.send(Msg::Extracted {
+            out_dir,
+            result,
+            rejected,
+        });
     });
 }
 
@@ -420,7 +475,11 @@ fn pump(ui: Ui, state: &Rc<RefCell<State>>) {
                 }
             }
             Msg::Scanned { package, result } => finish_scan(ui, state, package, result),
-            Msg::Extracted { out_dir, result } => finish_extract(ui, state, out_dir, result),
+            Msg::Extracted {
+                out_dir,
+                result,
+                rejected,
+            } => finish_extract(ui, state, out_dir, result, &rejected),
         }
     }
 }
@@ -443,29 +502,7 @@ fn finish_scan(
             st.package = Some(package);
             let files = st.entries.iter().filter(|e| !e.is_folder()).count();
             ui.status.set_label(&format!("Loaded {files} files."));
-            if !scanned.rejected.is_empty() {
-                let shown: Vec<_> = scanned
-                    .rejected
-                    .iter()
-                    .take(10)
-                    .map(String::as_str)
-                    .collect();
-                let more = scanned.rejected.len().saturating_sub(shown.len());
-                let mut msg = format!(
-                    "{} entries were skipped because their paths would land outside the output folder:\n\n{}",
-                    scanned.rejected.len(),
-                    shown.join("\n")
-                );
-                if more > 0 {
-                    msg.push_str(&format!("\n... and {more} more"));
-                }
-                message_box(
-                    ui,
-                    &msg,
-                    "Unsafe paths skipped",
-                    MessageDialogStyle::IconWarning,
-                );
-            }
+            warn_rejected(ui, &scanned.rejected);
         }
         Err(e) if st.cancel.load(Ordering::Relaxed) => {
             let _ = e;
@@ -484,6 +521,7 @@ fn finish_extract(
     state: &Rc<RefCell<State>>,
     out_dir: PathBuf,
     result: Result<Stats, String>,
+    rejected: &[String],
 ) {
     let mut st = state.borrow_mut();
     st.busy = Busy::Idle;
@@ -497,11 +535,15 @@ fn finish_extract(
                 format_size(stats.bytes),
                 out_dir.display()
             ));
+            warn_rejected(ui, rejected);
         }
         Err(_) if st.cancel.load(Ordering::Relaxed) => {
             ui.gauge.set_value(0);
-            ui.status
-                .set_label("Cancelled. Files already written were kept.");
+            ui.status.set_label(if ui.single_pass.is_checked() {
+                "Cancelled. The temp folder was removed; files already moved into place were kept."
+            } else {
+                "Cancelled. Files already written were kept."
+            });
         }
         Err(e) => {
             ui.gauge.set_value(0);
@@ -615,6 +657,11 @@ fn selected_guids(ui: Ui, st: &State) -> HashSet<String> {
 }
 
 fn update_summary(ui: Ui, st: &State) {
+    if ui.single_pass.is_checked() && st.package.is_some() {
+        ui.summary
+            .set_label("Single pass: every file will be extracted.");
+        return;
+    }
     if st.entries.is_empty() {
         ui.summary.set_label("");
         return;
@@ -645,12 +692,19 @@ fn update_summary(ui: Ui, st: &State) {
 
 fn refresh_controls(ui: Ui, st: &State) {
     let idle = st.busy == Busy::Idle;
+    let single_pass = ui.single_pass.is_checked();
     let loaded = !st.entries.is_empty();
+    let ready = if single_pass {
+        st.package.is_some()
+    } else {
+        loaded
+    };
     for w in [
         &ui.package_text as &dyn WxWidget,
         &ui.package_browse,
         &ui.output_text,
         &ui.output_browse,
+        &ui.single_pass,
     ] {
         WindowRef(w.handle_ptr()).enable(idle);
     }
@@ -660,11 +714,12 @@ fn refresh_controls(ui: Ui, st: &State) {
         &ui.select_none,
         &ui.expand_all,
     ] {
-        WindowRef(w.handle_ptr()).enable(idle && loaded);
+        // Single pass ignores the selection, so a tree from an earlier scan is read-only.
+        WindowRef(w.handle_ptr()).enable(idle && loaded && !single_pass);
     }
     ui.extract
         .set_label(if idle { "Extract" } else { "Cancel" });
-    ui.extract.enable(!idle || loaded);
+    ui.extract.enable(!idle || ready);
     ui.open_folder
         .enable(idle && Path::new(&ui.output_text.get_value()).is_dir());
     update_summary(ui, st);
@@ -686,6 +741,29 @@ fn open_in_file_manager(dir: &Path) {
         "xdg-open"
     };
     let _ = std::process::Command::new(program).arg(dir).spawn();
+}
+
+/// Warns about package entries whose paths would have escaped the output folder.
+fn warn_rejected(ui: Ui, rejected: &[String]) {
+    if rejected.is_empty() {
+        return;
+    }
+    let shown: Vec<_> = rejected.iter().take(10).map(String::as_str).collect();
+    let more = rejected.len() - shown.len();
+    let mut msg = format!(
+        "{} entries were skipped because their paths would land outside the output folder:\n\n{}",
+        rejected.len(),
+        shown.join("\n")
+    );
+    if more > 0 {
+        msg.push_str(&format!("\n... and {more} more"));
+    }
+    message_box(
+        ui,
+        &msg,
+        "Unsafe paths skipped",
+        MessageDialogStyle::IconWarning,
+    );
 }
 
 fn message_box(ui: Ui, message: &str, caption: &str, icon: MessageDialogStyle) {
